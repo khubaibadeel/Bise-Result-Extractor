@@ -62,12 +62,40 @@ def normalize_label(value: str) -> str:
     return clean_text(value)
 
 
+def extract_value_from_alias(info: dict[str, str], alias: str) -> str:
+    """Extract a value by a normalized label alias, preserving direct matches first."""
+    normalized_alias = normalize_label(alias)
+    if not normalized_alias:
+        return ""
+
+    if normalized_alias in info:
+        return info[normalized_alias]
+
+    for label, value in info.items():
+        normalized_label = normalize_label(label)
+        if normalized_label == normalized_alias:
+            return value
+        if normalized_alias in normalized_label or normalized_label in normalized_alias:
+            return value
+    return ""
+
+
 def parse_integer(value: str) -> Optional[int]:
     """Parse a plain non-negative integer such as '1,042'."""
-    cleaned = clean_text(value).replace(",", "")
+    if value is None:
+        return None
+    cleaned = clean_text(str(value)).replace(",", "")
     if re.fullmatch(r"\d+", cleaned):
         return int(cleaned)
     return None
+
+
+def normalize_roll_number(value: str) -> str:
+    """Keep only digits from a roll-number string, preserving a valid numeric identifier."""
+    if value is None:
+        return ""
+    digits = re.sub(r"\D+", "", clean_text(str(value)))
+    return digits
 
 
 def classify_academic_status(notification: str, total_marks: Optional[int]) -> str:
@@ -147,10 +175,23 @@ def extract_labeled_info(soup: BeautifulSoup) -> dict[str, str]:
     # Current 2026 page: labels and values are often emitted as ordinary text.
     lines = [clean_text(text) for text in soup.stripped_strings]
     aliases = {
-        "roll no": ("roll no", "roll number"),
-        "candidate name": ("name of candidate", "candidate name", "student name"),
-        "father name": ("father s name", "fathers name", "father name"),
-        "notification": ("notification",),
+        "roll no": ("roll no", "roll number", "roll no.", "roll #"),
+        "candidate name": (
+            "name of candidate",
+            "candidate name",
+            "student name",
+            "name of student",
+            "student's name",
+        ),
+        "father name": (
+            "father s name",
+            "fathers name",
+            "father name",
+            "father's name",
+            "name of father",
+            "father name ",
+        ),
+        "notification": ("notification", "remarks", "result status"),
     }
 
     for canonical, label_aliases in aliases.items():
@@ -165,12 +206,22 @@ def extract_labeled_info(soup: BeautifulSoup) -> dict[str, str]:
             if matched_alias is None:
                 continue
 
-            # Prefer text after ':' from the same visible line.
-            if ":" in line:
-                remainder = clean_text(line.split(":", 1)[1])
-                if remainder:
-                    values[canonical] = remainder
-                    break
+            # Prefer text after ':' or similar separators from the same visible line.
+            for separator in (":", "-", ".", "="):
+                if separator in line:
+                    before, after = line.split(separator, 1)
+                    if normalize_label(before).startswith(normalize_label(matched_alias)):
+                        remainder = clean_text(after)
+                        if remainder:
+                            values[canonical] = remainder
+                            break
+                    else:
+                        remainder = clean_text(after)
+                        if remainder and normalize_label(before).startswith(normalize_label(matched_alias)):
+                            values[canonical] = remainder
+                            break
+            if canonical in values:
+                break
 
             # Some markup places the label and value in adjacent text nodes.
             normalized_alias = normalize_label(matched_alias)
@@ -181,28 +232,23 @@ def extract_labeled_info(soup: BeautifulSoup) -> dict[str, str]:
                     break
 
             # Last fallback: remove the matched label from the beginning.
-            pattern = re.compile(r"^" + re.escape(matched_alias).replace(r"\ ", r"\s+") + r"\s*[.:\-]*\s*", re.I)
-            remainder = clean_text(pattern.sub("", normalized, count=1))
-            if remainder and remainder != normalized:
+            pattern = re.compile(
+                r"^" + re.escape(matched_alias).replace(r"\ ", r"\s+") + r"\s*[.:\-]*\s*",
+                re.I,
+            )
+            remainder = clean_text(pattern.sub("", line, count=1))
+            if remainder and remainder != line:
                 values[canonical] = remainder
                 break
-
 
     return values
 
 def first_matching_value(info: dict[str, str], aliases: tuple[str, ...]) -> str:
     """Return the first value whose normalized label matches an alias."""
-    normalized_aliases = tuple(normalize_label(alias) for alias in aliases)
-
-    for alias in normalized_aliases:
-        if alias in info:
-            return info[alias]
-
-    # Permit labels with harmless suffixes/prefixes such as ':' or '(candidate)'.
-    for label, value in info.items():
-        if any(alias and (alias in label or label in alias) for alias in normalized_aliases):
+    for alias in aliases:
+        value = extract_value_from_alias(info, alias)
+        if value:
             return value
-
     return ""
 
 
@@ -317,8 +363,7 @@ def parse_result(html_text: str, requested_roll: str) -> StudentResult:
 
     # Roll number is the strongest sanity check against an unexpected redirect
     # or generic landing page returned with HTTP 200.
-    parsed_roll_match = re.search(r"\d+", roll_number or "")
-    parsed_roll = parsed_roll_match.group(0) if parsed_roll_match else ""
+    parsed_roll = normalize_roll_number(roll_number)
 
     if not parsed_roll or not full_name or not father_name:
         return StudentResult(
@@ -335,7 +380,7 @@ def parse_result(html_text: str, requested_roll: str) -> StudentResult:
             ),
         )
 
-    if parsed_roll.lstrip("0") != requested_roll.lstrip("0"):
+    if normalize_roll_number(requested_roll) != parsed_roll:
         return StudentResult(
             requested_roll=requested_roll,
             roll_number=parsed_roll,
@@ -371,6 +416,7 @@ async def fetch_one(
 ) -> StudentResult:
     """Fetch one result with bounded concurrency and retryable errors."""
     url = BASE_URL.format(roll_number)
+    delay = 0
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -485,6 +531,15 @@ def is_supply_result(result: StudentResult) -> bool:
     return result.fetch_status == "found" and result.academic_status == "supply"
 
 
+def result_sort_key(result: StudentResult):
+    """Sort requested rolls numerically when possible, without crashing on bad data."""
+    raw_roll = result.requested_roll or ""
+    try:
+        return (0, int(raw_roll))
+    except (TypeError, ValueError):
+        return (1, raw_roll)
+
+
 def save_to_excel(results: list[StudentResult], output_path: Path) -> None:
     workbook = Workbook()
     worksheet = workbook.active
@@ -505,7 +560,7 @@ def save_to_excel(results: list[StudentResult], output_path: Path) -> None:
 
     found_results = sorted(
         (result for result in results if result.fetch_status == "found"),
-        key=lambda item: int(item.requested_roll),
+        key=result_sort_key,
     )
 
     for result in found_results:
@@ -533,7 +588,7 @@ def save_to_excel(results: list[StudentResult], output_path: Path) -> None:
     for cell in log_sheet[1]:
         cell.font = Font(bold=True)
 
-    for result in sorted(results, key=lambda item: int(item.requested_roll)):
+    for result in sorted(results, key=result_sort_key):
         if result.fetch_status == "found":
             continue
         log_sheet.append([result.requested_roll, result.fetch_status, result.error])
@@ -568,7 +623,7 @@ def save_to_html(
 ) -> None:
     found_results = sorted(
         (result for result in results if result.fetch_status == "found"),
-        key=lambda item: int(item.requested_roll),
+        key=result_sort_key,
     )
 
     supply_count = sum(result.academic_status == "supply" for result in found_results)
